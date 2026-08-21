@@ -1,1 +1,86 @@
+name: Build Recovery Image
 
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: 'Recovery Manifest URL'
+        required: true
+        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git'
+      manifest_branch:
+        description: 'Manifest Branch'
+        required: true
+        default: 'twrp-12.1'
+      device_path:
+        description: 'Device tree path'
+        required: true
+        default: 'device/infinix/X6886'
+      target_device:
+        description: 'Device target name'
+        required: true
+        default: 'X6886'
+      build_target:
+        description: 'Build target (recoveryimage / vendorbootimage)'
+        required: true
+        default: 'vendorbootimage'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Device Tree
+        uses: actions/checkout@v4
+        with:
+          path: device_tree
+
+      - name: Cleanup Space
+        uses: rokdd/cancel-workflow-action@v0.1.0
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf \
+            imagemagick lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses5 \
+            libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush \
+            rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
+
+      - name: Install Repo tool
+        run: |
+          mkdir -p ~/.bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+rx ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+
+      - name: Initialize Repo and Sync
+        run: |
+          mkdir -p /tmp/recovery_build
+          cd /tmp/recovery_build
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          repo init -u ${{ github.event.inputs.manifest_url }} -b ${{ github.event.inputs.manifest_branch }} --depth=1
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+      - name: Place Device Tree
+        run: |
+          mkdir -p /tmp/recovery_build/${{ github.event.inputs.device_path }}
+          cp -r device_tree/* /tmp/recovery_build/${{ github.event.inputs.device_path }}/
+
+      - name: Build Recovery
+        run: |
+          cd /tmp/recovery_build
+          export ALLOW_MISSING_DEPENDENCIES=true
+          source build/envsetup.sh
+          lunch twrp_${{ github.event.inputs.target_device }}-eng || lunch omni_${{ github.event.inputs.target_device }}-eng
+          mka ${{ github.event.inputs.build_target }} -j$(nproc --all)
+
+      - name: Upload Recovery Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-output
+          path: |
+            /tmp/recovery_build/out/target/product/${{ github.event.inputs.target_device }}/recovery.img
+            /tmp/recovery_build/out/target/product/${{ github.event.inputs.target_device }}/vendor_boot.img
+            /tmp/recovery_build/out/target/product/${{ github.event.inputs.target_device }}/boot.img
+            /tmp/recovery_build/out/target/product/${{ github.event.inputs.target_device }}/*.zip
+          if-no-files-found: warn

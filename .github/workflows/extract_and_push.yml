@@ -1,0 +1,110 @@
+name: Extract Vendor Boot and Push to Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      vendor_boot_url:
+        description: 'Direct URL to vendor_boot.img'
+        required: true
+        default: 'https://gitlab.com/Il103/android_dump_infinix_x6886/-/raw/a16/images/vendor_boot.img'
+      boot_url:
+        description: 'Direct URL to boot.img (optional for kernel extraction)'
+        required: false
+        default: 'https://gitlab.com/Il103/android_dump_infinix_x6886/-/raw/a16/boot/kernel'
+      commit_message:
+        description: 'Custom commit message'
+        required: false
+        default: 'Update prebuilt dtb, kernel, and recovery configs from vendor_boot'
+
+permissions:
+  contents: write
+
+jobs:
+  extract-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 \
+            python3-pip \
+            p7zip-full \
+            lz4 \
+            cpio \
+            curl \
+            wget \
+            git
+
+      - name: Download & Extract vendor_boot and boot
+        run: |
+          mkdir -p prebuilt recovery/root /tmp/work
+          cd /tmp/work
+
+          # Download unpack_bootimg from AOSP
+          wget -q https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/lineage-21.0/unpack_bootimg.py
+          chmod +x unpack_bootimg.py
+
+          echo "Downloading vendor_boot.img from ${{ github.event.inputs.vendor_boot_url }}..."
+          curl -L -s "${{ github.event.inputs.vendor_boot_url }}" -o vendor_boot.img
+
+          echo "Unpacking vendor_boot.img..."
+          python3 unpack_bootimg.py --boot_img vendor_boot.img --out vendor_boot_out
+
+          # Copy DTB
+          if [ -f vendor_boot_out/dtb ]; then
+            cp vendor_boot_out/dtb $GITHUB_WORKSPACE/prebuilt/dtb.img
+            echo "DTB extracted successfully."
+          fi
+
+          # Handle ramdisk / recovery_ramdisk
+          mkdir -p /tmp/work/ramdisk_out
+          cd /tmp/work/ramdisk_out
+          
+          RAMDISK_FILE=$(find /tmp/work/vendor_boot_out -name "vendor_ramdisk*" -o -name "ramdisk*" -o -name "*recovery_ramdisk*" | head -n 1)
+          if [ -n "$RAMDISK_FILE" ]; then
+            echo "Extracting ramdisk: $RAMDISK_FILE"
+            if lz4 -d -q "$RAMDISK_FILE" ramdisk.cpio 2>/dev/null; then
+              cpio -idm < ramdisk.cpio 2>/dev/null || true
+            elif gzip -dc "$RAMDISK_FILE" > ramdisk.cpio 2>/dev/null; then
+              cpio -idm < ramdisk.cpio 2>/dev/null || true
+            fi
+
+            # Copy relevant rc files if found
+            find . -name "init.recovery.*.rc" -exec cp {} $GITHUB_WORKSPACE/recovery/root/ \;
+            find . -name "ueventd*.rc" -exec cp {} $GITHUB_WORKSPACE/recovery/root/ \;
+            find . -name "fstab.*" -exec cp {} $GITHUB_WORKSPACE/recovery.fstab \;
+          fi
+
+          # Optional prebuilt kernel extraction
+          if [ -n "${{ github.event.inputs.boot_url }}" ]; then
+            echo "Downloading kernel / boot from ${{ github.event.inputs.boot_url }}..."
+            curl -L -s "${{ github.event.inputs.boot_url }}" -o /tmp/work/kernel_input
+            if file /tmp/work/kernel_input | grep -q "Android bootimg"; then
+              python3 /tmp/work/unpack_bootimg.py --boot_img /tmp/work/kernel_input --out /tmp/work/boot_out
+              if [ -f /tmp/work/boot_out/kernel ]; then
+                cp /tmp/work/boot_out/kernel $GITHUB_WORKSPACE/prebuilt/kernel
+              fi
+            else
+              cp /tmp/work/kernel_input $GITHUB_WORKSPACE/prebuilt/kernel
+            fi
+            echo "Kernel updated successfully."
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add -A
+          if git diff-index --quiet HEAD --; then
+            echo "No changes to commit."
+          else
+            git commit -m "${{ github.event.inputs.commit_message }} [skip ci]"
+            git push origin HEAD:${{ github.ref }}
+          fi
